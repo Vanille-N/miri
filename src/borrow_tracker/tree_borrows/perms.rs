@@ -1,9 +1,9 @@
 use std::cmp::{Ordering, PartialOrd};
 use std::fmt;
 
+use crate::AccessKind;
 use crate::borrow_tracker::tree_borrows::diagnostics::TransitionError;
 use crate::borrow_tracker::tree_borrows::tree::AccessRelatedness;
-use crate::AccessKind;
 
 /// The activation states of a pointer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -47,7 +47,8 @@ enum PermissionPriv {
     /// rejects: all child accesses (UB).
     Disabled,
 }
-use PermissionPriv::*;
+use self::PermissionPriv::*;
+use super::foreign_access_skipping::IdempotentForeignAccess;
 
 impl PartialOrd for PermissionPriv {
     /// PermissionPriv is ordered by the reflexive transitive closure of
@@ -86,6 +87,28 @@ impl PermissionPriv {
     /// Reject `ReservedIM` that cannot exist in the presence of a protector.
     fn compatible_with_protector(&self) -> bool {
         !matches!(self, ReservedIM)
+    }
+
+    /// See `foreign_access_skipping.rs`. Computes the SIFA of a permission.
+    fn strongest_idempotent_foreign_access(&self, prot: bool) -> IdempotentForeignAccess {
+        match self {
+            // A protected non-conflicted Reserved will become conflicted under a foreign read,
+            // and is hence not idempotent under it.
+            ReservedFrz { conflicted } if prot && !conflicted => IdempotentForeignAccess::None,
+            // Otherwise, foreign reads do not affect Reserved
+            ReservedFrz { .. } => IdempotentForeignAccess::Read,
+            // Famously, ReservedIM survives foreign writes. It is never protected.
+            ReservedIM if prot => unreachable!("Protected ReservedIM should not exist!"),
+            ReservedIM => IdempotentForeignAccess::Write,
+            // Active changes on any foreign access (becomes Frozen/Disabled).
+            Active => IdempotentForeignAccess::None,
+            // Frozen survives foreign reads, but not writes.
+            Frozen => IdempotentForeignAccess::Read,
+            // Disabled survives foreign reads and writes. It survives them
+            // even if protected, because a protected `Disabled` is not initialized
+            // and does therefore not trigger UB.
+            Disabled => IdempotentForeignAccess::Write,
+        }
     }
 }
 
@@ -130,7 +153,7 @@ mod transition {
             Active =>
                 if protected {
                     // We wrote, someone else reads -- that's bad.
-                    // (If this is initialized, this move-to-protected will mean insta-UB.)
+                    // (Since Active is always initialized, this move-to-protected will mean insta-UB.)
                     Disabled
                 } else {
                     // We don't want to disable here to allow read-read reordering: it is crucial
@@ -214,6 +237,10 @@ impl Permission {
     pub fn is_active(&self) -> bool {
         self.inner == Active
     }
+    /// Check if `self` is the never-allow-writes-again state of a pointer (is `Frozen`).
+    pub fn is_frozen(&self) -> bool {
+        self.inner == Frozen
+    }
 
     /// Default initial permission of the root of a new tree at inbounds positions.
     /// Must *only* be used for the root, this is not in general an "initial" permission!
@@ -266,6 +293,51 @@ impl Permission {
         let old_state = old_perm.inner;
         transition::perform_access(kind, rel_pos, old_state, protected)
             .map(|new_state| PermTransition { from: old_state, to: new_state })
+    }
+
+    /// During a provenance GC, we want to compact the tree.
+    /// For this, we want to merge nodes upwards if they have a singleton parent.
+    /// But we need to be careful: If the parent is Frozen, and the child is Reserved,
+    /// we can not do such a merge. In general, such a merge is possible if the parent
+    /// allows similar accesses, and in particular if the parent never causes UB on its
+    /// own. This is enforced by a test, namely `tree_compacting_is_sound`. See that
+    /// test for more information.
+    /// This method is only sound if the parent is not protected. We never attempt to
+    /// remove protected parents.
+    pub fn can_be_replaced_by_child(self, child: Self) -> bool {
+        match (self.inner, child.inner) {
+            // ReservedIM can be replaced by anything, as it allows all
+            // transitions.
+            (ReservedIM, _) => true,
+            // Reserved (as parent, where conflictedness does not matter)
+            // can be replaced by all but ReservedIM,
+            // since ReservedIM alone would survive foreign writes
+            (ReservedFrz { .. }, ReservedIM) => false,
+            (ReservedFrz { .. }, _) => true,
+            // Active can not be replaced by something surviving
+            // foreign reads and then remaining writable.
+            (Active, ReservedIM) => false,
+            (Active, ReservedFrz { .. }) => false,
+            // Replacing a state by itself is always okay, even if the child state is protected.
+            (Active, Active) => true,
+            // Active can be replaced by Frozen, since it is not protected.
+            (Active, Frozen) => true,
+            (Active, Disabled) => true,
+            // Frozen can only be replaced by Disabled (and itself).
+            (Frozen, Frozen) => true,
+            (Frozen, Disabled) => true,
+            (Frozen, _) => false,
+            // Disabled can not be replaced by anything else.
+            (Disabled, Disabled) => true,
+            (Disabled, _) => false,
+        }
+    }
+
+    /// Returns the strongest foreign action this node survives (without change),
+    /// where `prot` indicates if it is protected.
+    /// See `foreign_access_skipping`
+    pub fn strongest_idempotent_foreign_access(&self, prot: bool) -> IdempotentForeignAccess {
+        self.inner.strongest_idempotent_foreign_access(prot)
     }
 }
 
@@ -513,7 +585,7 @@ impl Permission {
 #[cfg(test)]
 mod propagation_optimization_checks {
     pub use super::*;
-    use crate::borrow_tracker::tree_borrows::exhaustive::{precondition, Exhaustive};
+    use crate::borrow_tracker::tree_borrows::exhaustive::{Exhaustive, precondition};
 
     impl Exhaustive for PermissionPriv {
         fn exhaustive() -> Box<dyn Iterator<Item = Self>> {
@@ -541,7 +613,7 @@ mod propagation_optimization_checks {
     impl Exhaustive for AccessRelatedness {
         fn exhaustive() -> Box<dyn Iterator<Item = Self>> {
             use AccessRelatedness::*;
-            Box::new(vec![This, StrictChildAccess, AncestorAccess, DistantAccess].into_iter())
+            Box::new(vec![This, StrictChildAccess, AncestorAccess, CousinAccess].into_iter())
         }
     }
 
@@ -595,6 +667,35 @@ mod propagation_optimization_checks {
                             perform_access(new_access, rel_pos, new, new_protected).unwrap()
                         );
                     }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[rustfmt::skip]
+    fn permission_sifa_is_correct() {
+        // Tests that `strongest_idempotent_foreign_access` is correct. See `foreign_access_skipping.rs`.
+        for perm in PermissionPriv::exhaustive() {
+            // Assert that adding a protector makes it less idempotent.
+            if perm.compatible_with_protector() {
+                assert!(perm.strongest_idempotent_foreign_access(true) <= perm.strongest_idempotent_foreign_access(false));
+            }
+            for prot in bool::exhaustive() {
+                if prot {
+                    precondition!(perm.compatible_with_protector());
+                }
+                let access = perm.strongest_idempotent_foreign_access(prot);
+                // We now assert it is idempotent, and never causes UB.
+                // First, if the SIFA includes foreign reads, assert it is idempotent under foreign reads.
+                if access >= IdempotentForeignAccess::Read {
+                    // We use `CousinAccess` here. We could also use `AncestorAccess`, since `transition::perform_access` treats these the same.
+                    // The only place they are treated differently is in protector end accesses, but these are not handled here.
+                    assert_eq!(perm, transition::perform_access(AccessKind::Read, AccessRelatedness::CousinAccess, perm, prot).unwrap());
+                }
+                // Then, if the SIFA includes foreign writes, assert it is idempotent under foreign writes.
+                if access >= IdempotentForeignAccess::Write {
+                    assert_eq!(perm, transition::perform_access(AccessKind::Write, AccessRelatedness::CousinAccess, perm, prot).unwrap());
                 }
             }
         }

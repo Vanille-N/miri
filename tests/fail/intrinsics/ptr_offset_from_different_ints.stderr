@@ -1,13 +1,13 @@
-error: Undefined Behavior: `ptr_offset_from` called on different pointers without provenance (i.e., without an associated allocation)
-  --> $DIR/ptr_offset_from_different_ints.rs:LL:CC
+error: Undefined Behavior: `ptr_offset_from` called on two different pointers that are not both derived from the same allocation
+  --> tests/fail/intrinsics/ptr_offset_from_different_ints.rs:LL:CC
    |
 LL |         let _ = p1.byte_offset_from(p2);
-   |                 ^^^^^^^^^^^^^^^^^^^^^^^ `ptr_offset_from` called on different pointers without provenance (i.e., without an associated allocation)
+   |                 ^^^^^^^^^^^^^^^^^^^^^^^ `ptr_offset_from` called on two different pointers that are not both derived from the same allocation
    |
    = help: this indicates a bug in the program: it performed an invalid operation, and caused Undefined Behavior
    = help: see https://doc.rust-lang.org/nightly/reference/behavior-considered-undefined.html for further information
    = note: BACKTRACE:
-   = note: inside `main` at $DIR/ptr_offset_from_different_ints.rs:LL:CC
+   = note: inside `main` at tests/fail/intrinsics/ptr_offset_from_different_ints.rs:LL:CC
 
 note: some details are omitted, run with `MIRIFLAGS=-Zmiri-backtrace=full` for a verbose backtrace
 
